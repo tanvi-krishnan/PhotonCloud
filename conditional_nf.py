@@ -1,3 +1,5 @@
+# Normalizing Flow Training Script
+# To run: python conditional_nf.py --num_flows 10 --num_epochs 8 --num_samples 1000000 --batch_size 64 --target_time 10.0 --max_time 20.0
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -26,13 +28,19 @@ args = parser.parse_args()
 # Set global font size for all elements in matplotlib
 plt.rcParams.update({'font.size': 18})  # Adjust font size as desired
 
-# Define RealNVPNode with time treated as an input variable
+# Define RealNVP layer that uses masks to transform inputs
 class RealNVPNode(nn.Module):
     def __init__(self, mask, hidden_size):
+        """
+        Initializes a RealNVP node (a single layer in the flow model).
+        mask: Binary tensor to control active/passive dimensions.
+        hidden_size: Number of hidden units in each intermediate layer.
+        """
         super(RealNVPNode, self).__init__()
-        self.dim = len(mask)
-        self.mask = nn.Parameter(mask, requires_grad=False)
+        self.dim = len(mask) # Dimensionality of the data
+        self.mask = nn.Parameter(mask, requires_grad=False) # Non-trainable mask
 
+        # Define scale (s) and translation (t) networks
         input_size = self.dim 
         self.s_func = nn.Sequential(
             nn.Linear(input_size, hidden_size),
@@ -48,34 +56,43 @@ class RealNVPNode(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(hidden_size, self.dim)
         )
+        # Scale parameter to stabilize training
         self.scale = nn.Parameter(torch.zeros(self.dim))
 
     def forward(self, x):
-        # Apply mask to separate active and passive parts for all dimensions
-        mask = self.mask.view(1, -1).expand(x.shape[0], -1)  # Expand mask to match the batch size and input dimensions
-        x_mask = x * mask  # Masked part remains fixed
+        """
+        Forward transformation: Applies the flow layer transformation.
+        Returns transformed data (y) and log-determinant of the Jacobian.
+        """
+        # Separate active and passive parts of the input
+        mask = self.mask.view(1, -1).expand(x.shape[0], -1)  
+        x_mask = x * mask  # Masked parts remains fixed
 
-        # Use x_mask (passive part) to generate s and t for active parts
+        # Compute scale (s) and translation (t) parameters
         s = self.s_func(x_mask) * self.scale
-        s = torch.clamp(s, min=-5.0, max=5.0)
+        s = torch.clamp(s, min=-5.0, max=5.0) # Prevent overflow in exp
         t = self.t_func(x_mask)
 
-        # Apply transformation to active parts
+        # Apply transformation to active parts of the input
         y = x_mask + (1 - mask) * (x * torch.exp(s) + t)
-        log_det_jac = ((1 - mask) * s).sum(-1)
+        log_det_jac = ((1 - mask) * s).sum(-1) # Log-determinant of the Jacobian
         return y, log_det_jac
 
     def inverse(self, y):
-        # Apply mask to separate active and passive parts for all dimensions
-        mask = self.mask.view(1, -1).expand(y.shape[0], -1)  # Expand mask to match the batch size and input dimensions
-        y_mask = y * mask  # Masked part remains fixed
+        """
+        Inverse transformation: Applies the reverse transformation.
+        Returns original input (x) and inverse log-determinant of the Jacobian.
+        """
+        # Separate active and passive parts of the input
+        mask = self.mask.view(1, -1).expand(y.shape[0], -1) 
+        y_mask = y * mask  
 
-        # Use y_mask (passive part) to generate s and t for active parts
+        # Compute scale (s) and translation (t) parameters
         s = self.s_func(y_mask) * self.scale
         s = torch.clamp(s, min=-5.0, max=5.0)
         t = self.t_func(y_mask)
 
-        # Apply inverse transformation to active parts
+        # Transform back the active parts
         x = y_mask + (1 - mask) * (y - t) * torch.exp(-s)
         inv_log_det_jac = ((1 - mask) * -s).sum(-1)
         return x, inv_log_det_jac
@@ -83,47 +100,65 @@ class RealNVPNode(nn.Module):
 # Stack RealNVP layers into a normalizing flow model
 class RealNVP(nn.Module):
     def __init__(self, masks, hidden_size):
+        """
+        Initializes the RealNVP model as a stack of flow layers.
+        masks: List of masks for each flow layer.
+        hidden_size: Number of hidden units in intermediate layers.
+        """
         super(RealNVP, self).__init__()
-        self.dim = len(masks[0])
+        self.dim = len(masks[0])  # Dimensionality of the data
         self.hidden_size = hidden_size
 
+        # Store masks and initialize flow layers
         self.masks = nn.ParameterList([nn.Parameter(mask, requires_grad=False) for mask in masks])
         self.layers = nn.ModuleList([RealNVPNode(mask, self.hidden_size) for mask in self.masks])
 
     def base_distribution(self):
+        """
+        Base distribution: A multivariate Gaussian with zero mean and identity covariance.
+        """
         mean = torch.zeros(self.dim).to(device)
         cov_matrix = torch.eye(self.dim).to(device)
         return MultivariateNormal(mean, cov_matrix)
 
     def log_probability(self, x):
+        """
+        Compute the log-probability of data samples under the flow model.
+        """
         log_prob = torch.zeros(x.shape[0], device=x.device)
-        for layer in reversed(self.layers):
+        for layer in reversed(self.layers): # Invert transformations
             x, inv_log_det_jac = layer.inverse(x)
-            log_prob += inv_log_det_jac
+            log_prob += inv_log_det_jac # Accumulate log-determinants
         base_dist = self.base_distribution()
-        log_prob += base_dist.log_prob(x)
+        log_prob += base_dist.log_prob(x) # Add base distribution log-prob
         return log_prob
 
     def rsample(self, num_samples):
+        """
+        Generate samples from the trained flow model.
+        """
         base_dist = self.base_distribution()
-        x = base_dist.sample((num_samples,))
+        x = base_dist.sample((num_samples,))  # Sample from base distribution
         log_prob = base_dist.log_prob(x)
-        for layer in self.layers:
+        for layer in self.layers:  # Apply flow transformations
             x, log_det_jac = layer.forward(x)
             log_prob += log_det_jac
         return x, log_prob
 
-# Generate masks for RealNVP layers
+# Function to create alternating binary masks for RealNVP layers
 def create_alternating_masks(dim, num_layers):
     masks = []
     for i in range(num_layers):
         mask = torch.zeros(dim)
-        mask[i % dim::2] = 1
+        mask[i % dim::2] = 1 # Alternate mask pattern
         masks.append(mask)
     return masks
 
-# Define training loop
+# Training loop for the flow model
 def train_flow_model(flow_model, data, optimizer, num_epochs, batch_size):
+    """
+    Train the normalizing flow model using maximum likelihood estimation.
+    """
     train_loader = DataLoader(data, batch_size=batch_size, shuffle=True)
     losses = []
 
@@ -134,7 +169,7 @@ def train_flow_model(flow_model, data, optimizer, num_epochs, batch_size):
             time_value = None  # Use the average time value for training
             optimizer.zero_grad()
             log_prob = flow_model.log_probability(batch_data)
-            loss = -log_prob.mean()
+            loss = -log_prob.mean() # Negative log-likelihood
             loss.backward()
 
             # Apply gradient clipping
@@ -151,6 +186,9 @@ def train_flow_model(flow_model, data, optimizer, num_epochs, batch_size):
 
 # Function to load and preprocess data from npy file
 def load_and_preprocess_data(file_path):
+    """
+    Load photon data from a .npy file and preprocess it for training.
+    """
     data = np.load(file_path, allow_pickle=True)
     flattened_data = []
 
@@ -169,12 +207,15 @@ def load_and_preprocess_data(file_path):
 
 # Main block
 if __name__ == '__main__':
+    """
+    Main script to train the normalizing flow model and evaluate its performance.
+    """
     # Load data and prepare for training
     data = load_and_preprocess_data("photon_data.npy")
     dataset = TensorDataset(data)  # Wrap the data in a TensorDataset
 
     # Initialize the RealNVP model and optimizer
-    masks = create_alternating_masks(3 + 1, args.num_flows)  # 3 spatial dim +1 for time dimension
+    masks = create_alternating_masks(3 + 1, args.num_flows)  # 3 spatial dim + 1 for time 
     flow_model = RealNVP(masks, hidden_size=32).to(device)
     optimizer = optim.Adam(flow_model.parameters(), lr=1e-4)
 
@@ -282,12 +323,8 @@ if __name__ == '__main__':
                 log_probs = flow_model.log_probability(grid_points_tensor)
                 densities += np.exp(log_probs.cpu().numpy())
 
-        # Average to integrate over z
         densities /= num_z_samples
-        # Average the log probabilities to marginalize over z
-        
-        # Convert log-probs to densities
-                
+                        
         # Reshape densities to match the grid shape
         density_grid = densities.reshape(xx.shape)
 
@@ -302,7 +339,6 @@ if __name__ == '__main__':
         )
         plt.colorbar(label='Density')
         plt.clim(vmin=0, vmax=0.00005)
-        # plt.title(f"Photon Position Continuous PDF at t ≈ {target_time}")
         plt.xlabel("x Position")
         plt.ylabel("y Position")
         plt.savefig(f"continuous_pdf_t_{target_time}.png", bbox_inches='tight')
