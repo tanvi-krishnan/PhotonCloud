@@ -1,11 +1,4 @@
 #!/bin/bash
-#SBATCH -t 0-24:00
-#SBATCH --mem=5000
-#SBATCH --output=run_all_%j.out  # Corrected this line
-#SBATCH --error=run_all_%j.err
-#SBATCH --partition=arguelles_delgado
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
 
 # Define paths to the scripts
 PHOTON_MC_SCRIPT="photon_MC.py"
